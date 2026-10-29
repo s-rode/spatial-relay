@@ -10,6 +10,8 @@ Run `Scripts/test-core.sh` for device-free tests under AddressSanitizer, with Un
 
 The original XCTest suite remains in `SpatialRelayTests`. CI runs it with Xcode, the standalone sanitizer tests, static analysis, and a Release build. `Scripts/build-local.sh` builds with Command Line Tools, signs with App Sandbox and hardened runtime, and rejects a binary containing compiler coverage counters. Full Xcode is required for the XCTest command in the main README.
 
+The first live AirPods test exposed a startup regression in the initial fork: the 350 ms limit repeatedly flushed AVFoundation before its playback clock could advance. Preparing the renderer before starting capture and using natural-rate varispeed removed that loop in the subsequent probe. Queue metadata stayed at 190–201 ms after warmup for 15 seconds, without resynchronization. That probe received silent samples, so it does not establish audible music or working spatialization. Do not treat the initial CI pass as evidence of those real-device behaviors.
+
 Read-only discovery can be checked with:
 
 ```sh

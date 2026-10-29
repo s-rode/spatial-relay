@@ -20,8 +20,13 @@ Changes in this fork:
 - Keep a fixed five-second renderer recovery deadline across repeated notifications.
 - Show the estimated relay queue instead of a fixed latency label. This excludes device, Bluetooth, and system processing latency.
 - Disable coverage instrumentation in distribution builds and reject instrumented binaries during packaging.
+- Prepare the renderer before starting the tap and use varispeed only at natural playback rate, avoiding an unnecessary pitch-correction window during live startup.
+- Reject late errors from a replaced pipeline and keep Core Audio teardown on one control queue.
+- Prevent another menu-bar copy from starting while the local fork is already running.
 
 Read-only hardware discovery is available with `Spatial Relay Local.app/Contents/MacOS/SpatialRelay --diagnostics`. It does not start capture. A running relay and a recognized AirPods name do not prove that spatialization is active: Fixed and Head Tracked still need to be checked on the actual Mac and headphones.
+
+For a bounded live diagnostic, quit the menu-bar copy and run the executable with `--playback-test`. It relays Spotify for 15 seconds, prints queue/clock metadata, and then stops normally. This mode requires recording permission and can interrupt playback; it does not save audio. A `Silent` label means no nonzero samples have reached the tap recently, including during a normal Spotify pause.
 
 [![CI](https://github.com/s-rode/spatial-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/s-rode/spatial-relay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

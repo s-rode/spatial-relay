@@ -1,6 +1,12 @@
 import CoreAudio
 import Foundation
 
+struct RelayGeneration {
+    private(set) var value: UInt64 = 0
+    mutating func advance() { value &+= 1 }
+    func accepts(_ token: UInt64) -> Bool { token == value }
+}
+
 struct CoreAudioFailure: LocalizedError, Equatable {
     let operation: String
     let status: OSStatus

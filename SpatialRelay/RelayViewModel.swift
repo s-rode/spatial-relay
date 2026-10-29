@@ -244,7 +244,7 @@ final class RelayViewModel: ObservableObject {
                 guard let self, self.panelIsVisible, self.isRelaying, self.relaySessionID == sessionID else { return }
                 let peak = CGFloat(pow(max(0, min(1, metrics.peakLevel)), 0.45))
                 self.meterLevel = max(peak, self.meterLevel * 0.72)
-                self.latencyLabel = "\(Int(metrics.bufferedMilliseconds.rounded())) ms queued"
+                self.latencyLabel = (metrics.isIdlePolling ? "Silent · " : "") + "\(Int(metrics.bufferedMilliseconds.rounded())) ms queued"
                     + (metrics.resynchronizationCount > 0 ? " · \(metrics.resynchronizationCount) resync" : "")
             }
         }

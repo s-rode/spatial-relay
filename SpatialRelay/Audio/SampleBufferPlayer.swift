@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import OSLog
 
 enum OutputReconfigurationGrace {
     static let durationMilliseconds: UInt64 = 5_000
@@ -62,6 +63,9 @@ struct PlaybackBufferStatus: Sendable {
     let queuedFrames: Int64
     let resynchronizationCount: UInt64
     let isIdlePolling: Bool
+    let timebaseRate: Float
+    let playheadSeconds: Double
+    let hasSufficientData: Bool
 }
 
 enum RendererRecoveryTimeline {
@@ -95,6 +99,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
     private let capture: SRAudioCaptureBridge
     private let renderer = AVSampleBufferAudioRenderer()
+    private let logger = Logger(subsystem: "com.srode.SpatialRelay", category: "playback")
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let serializationQueue = DispatchQueue(label: "com.shevlfs.SpatialRelay.sample-buffer-player")
     private let queueKey = DispatchSpecificKey<UInt8>()
@@ -174,6 +179,9 @@ final class SampleBufferPlayer: @unchecked Sendable {
             // Audio-only renderers default to multichannel spatialization. This explicit
             // opt-in is what makes ordinary two-channel PCM eligible for Spatialize Stereo.
             renderer.allowedAudioSpatializationFormats = .monoAndStereo
+            // Playback is always at rate 1. No pitch-correction/time-stretch
+            // window is needed for this live stream.
+            renderer.audioTimePitchAlgorithm = .varispeed
             renderer.volume = 1
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
             synchronizer.addRenderer(renderer)
@@ -233,7 +241,10 @@ final class SampleBufferPlayer: @unchecked Sendable {
             PlaybackBufferStatus(
                 queuedFrames: queuedFrameCount(),
                 resynchronizationCount: resynchronizationCount,
-                isIdlePolling: isIdlePolling
+                isIdlePolling: isIdlePolling,
+                timebaseRate: synchronizer.rate,
+                playheadSeconds: synchronizer.currentTime().seconds,
+                hasSufficientData: renderer.hasSufficientMediaDataForReliablePlaybackStart
             )
         }
     }
@@ -328,6 +339,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             queued: queuedFrameCount(),
             sampleRate: sampleRate
         ) {
+            logger.notice("Buffer resync: capture=\(self.capture.availableFrameCount) queued=\(self.queuedFrameCount()) playhead=\(self.synchronizer.currentTime().seconds) rate=\(self.synchronizer.rate) sufficient=\(self.renderer.hasSufficientMediaDataForReliablePlaybackStart)")
             guard resynchronizationBudget.record(at: DispatchTime.now().uptimeNanoseconds) else {
                 deliverFailure(RelayError.rendererFailed("audio repeatedly exceeded the 350 ms live-buffer limit"))
                 return
@@ -500,9 +512,10 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private func deliverFailure(_ error: Error) {
         guard !failureWasDelivered else { return }
         failureWasDelivered = true
-        // Do not wait for the main actor to tear down the UI. Stopping the IOProc
-        // here immediately releases mutedWhenTapped during renderer failures.
-        try? capture.stop()
+        // The background coordinator owns HAL teardown. Never mutate capture
+        // ownership on this queue while its health check may inspect the bridge.
+        synchronizer.setRate(0, time: .invalid)
+        renderer.flush()
         onFailure(error)
     }
 

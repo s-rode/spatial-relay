@@ -4,6 +4,14 @@ import XCTest
 @testable import SpatialRelay
 
 final class CoreLogicTests: XCTestCase {
+    func testReplacedPipelineRejectsLateFailureToken() {
+        var generation = RelayGeneration()
+        let oldToken = generation.value
+        generation.advance()
+        XCTAssertFalse(generation.accepts(oldToken))
+        XCTAssertTrue(generation.accepts(generation.value))
+    }
+
     func testRepeatedOutputNotificationsCannotExtendRecoveryDeadline() {
         var window = OutputRecoveryWindow()
         window.begin(at: 100)

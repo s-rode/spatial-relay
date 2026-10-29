@@ -4,6 +4,12 @@ import Foundation
 @main
 struct PlaybackPolicyTests {
     static func main() {
+        var generation = RelayGeneration()
+        let old = generation.value
+        generation.advance()
+        precondition(!generation.accepts(old))
+        precondition(generation.accepts(generation.value))
+        print("PASS: a replaced pipeline rejects late failures from its predecessor")
         let start: UInt64 = 1_000_000
         var recovery = OutputRecoveryWindow()
         precondition(!recovery.contains(start))

@@ -12,6 +12,7 @@ struct RelayMetrics: Sendable {
     let droppedFrameCount: UInt64
     let resynchronizationCount: UInt64
     let isIdlePolling: Bool
+    let diagnostic: String
 }
 
 enum RelayRouteEvent: Sendable {
@@ -41,6 +42,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     private var sampleRateMismatchStartTime: DispatchTime?
 
     private var isActive = false
+    private var generation = RelayGeneration()
     private var healthTimer: DispatchSourceTimer?
     private var failureHandler: (@Sendable (Error) -> Void)?
     private var routeHandler: (@Sendable (RelayRouteUpdate) -> Void)?
@@ -116,6 +118,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             aggregateID = try hardware.createAggregateDevice(tapUID: uid)
 
             let capture = SRAudioCaptureBridge()
+            let pipelineToken = generation.value
             let player = try SampleBufferPlayer(
                 capture: capture,
                 sampleRate: format.mSampleRate,
@@ -123,7 +126,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             ) { [weak self] error in
                 guard let self else { return }
                 self.controlQueue.async { [weak self] in
-                    guard let self, self.isActive else { return }
+                    guard let self, self.isActive, self.generation.accepts(pipelineToken) else { return }
                     let routeChanged = self.outputRouteChanged()
                     // Flush playback before stopping the tap, then immediately release
                     // mutedWhenTapped so Spotify's direct output is restored.
@@ -144,13 +147,14 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             self.capture = capture
             self.player = player
 
+            // Prepare AVFoundation before muting/capturing Spotify, so device
+            // setup cannot accumulate old PCM before the first pump runs.
+            player.start()
             do {
                 try capture.startCapturingDevice(aggregateID, format: format)
             } catch {
                 throw RelayError.captureFailed(error.localizedDescription)
             }
-            player.start()
-
             activeOutput = output
             activeProcessIDs = Set(processes.map(\.id))
             activeSampleRate = format.mSampleRate
@@ -256,6 +260,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     }
 
     private func stopPipeline() -> Error? {
+        generation.advance()
         isActive = false
         return tearDownPipeline()
     }
@@ -263,7 +268,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     func metrics() -> RelayMetrics {
         performSync {
             guard let capture, activeSampleRate > 0 else {
-                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0, resynchronizationCount: 0, isIdlePolling: false)
+                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0, resynchronizationCount: 0, isIdlePolling: false, diagnostic: "stopped")
             }
             let playback = player?.bufferStatus()
             let buffered = (Double(capture.availableFrameCount) + Double(playback?.queuedFrames ?? 0)) / activeSampleRate * 1_000
@@ -272,7 +277,8 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 bufferedMilliseconds: buffered,
                 droppedFrameCount: capture.droppedFrameCount,
                 resynchronizationCount: playback?.resynchronizationCount ?? 0,
-                isIdlePolling: playback?.isIdlePolling ?? false
+                isIdlePolling: playback?.isIdlePolling ?? false,
+                diagnostic: "capture=\(capture.availableFrameCount) renderer=\(playback?.queuedFrames ?? 0) rate=\(playback?.timebaseRate ?? 0) playhead=\(playback?.playheadSeconds ?? 0) sufficient=\(playback?.hasSufficientData ?? false)"
             )
         }
     }
