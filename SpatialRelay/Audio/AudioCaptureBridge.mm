@@ -31,6 +31,8 @@ struct CaptureStorage {
     std::atomic<UInt64> formatMismatches { 0 };
     std::atomic<UInt64> callbacks { 0 };
     std::atomic<UInt64> capturedFrames { 0 };
+    std::atomic<UInt64> signalFrames { 0 };
+    std::atomic<UInt64> discardedFrames { 0 };
     std::atomic<UInt32> peakBits { 0 };
 
     bool nonInterleaved = false;
@@ -43,6 +45,8 @@ struct CaptureStorage {
         formatMismatches.store(0, std::memory_order_relaxed);
         callbacks.store(0, std::memory_order_relaxed);
         capturedFrames.store(0, std::memory_order_relaxed);
+        signalFrames.store(0, std::memory_order_relaxed);
+        discardedFrames.store(0, std::memory_order_relaxed);
         storePeak(0.0f);
     }
 
@@ -107,6 +111,7 @@ struct CaptureStorage {
         }
         storePeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
+        if (peak > 0) signalFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
     }
 
@@ -128,7 +133,17 @@ struct CaptureStorage {
 
         storePeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
+        if (peak > 0) signalFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
+    }
+
+    UInt32 discardKeepingLatest(UInt32 keep) noexcept {
+        const auto read = readCursor.load(std::memory_order_relaxed);
+        const auto write = writeCursor.load(std::memory_order_acquire);
+        const auto discard = static_cast<UInt32>((write - read) > keep ? (write - read) - keep : 0);
+        readCursor.store(read + discard, std::memory_order_release);
+        discardedFrames.fetch_add(discard, std::memory_order_relaxed);
+        return discard;
     }
 
     UInt32 readInterleaved(float *destination, UInt32 maximumFrames) noexcept {
@@ -312,6 +327,18 @@ NSError *captureError(NSString *operation, OSStatus status) {
 - (float)peakLevel {
     auto *state = storage(self);
     return state == nullptr ? 0.0f : state->takePeak();
+}
+
+- (UInt64)signalFrameCount {
+    return storage(self)->signalFrames.load(std::memory_order_relaxed);
+}
+
+- (UInt64)discardedFrameCount {
+    return storage(self)->discardedFrames.load(std::memory_order_relaxed);
+}
+
+- (UInt32)discardFramesKeepingLatest:(UInt32)frameCount {
+    return storage(self)->discardKeepingLatest(frameCount);
 }
 
 - (BOOL)startCapturingDevice:(AudioObjectID)deviceID

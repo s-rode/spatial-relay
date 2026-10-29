@@ -4,6 +4,41 @@ import XCTest
 @testable import SpatialRelay
 
 final class CoreLogicTests: XCTestCase {
+    func testRepeatedOutputNotificationsCannotExtendRecoveryDeadline() {
+        var window = OutputRecoveryWindow()
+        window.begin(at: 100)
+        window.begin(at: 4_000_000_100)
+        XCTAssertTrue(window.contains(5_000_000_100))
+        XCTAssertFalse(window.contains(5_000_000_101))
+        window.finish()
+        window.begin(at: 6_000_000_100)
+        XCTAssertTrue(window.contains(7_000_000_100))
+    }
+
+    func testLatencyBudgetIncludesRendererQueue() {
+        XCTAssertFalse(LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 16_800, sampleRate: 48_000))
+        XCTAssertTrue(LivePlaybackPolicy.needsResynchronization(captured: 1, queued: 16_800, sampleRate: 48_000))
+        XCTAssertTrue(LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 48_000, sampleRate: 48_000))
+    }
+
+    func testDiscardKeepsNewestFramesWithoutResettingCapture() throws {
+        let bridge = SRAudioCaptureBridge()
+        let input: [Float] = [1, -1, 2, -2, 3, -3, 4, -4]
+        bridge.debugEnqueueInterleavedFloat(input.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(bridge.discardFramesKeepingLatest(2), 2)
+        XCTAssertEqual(bridge.capturedFrameCount, 4)
+        XCTAssertEqual(bridge.discardedFrameCount, 2)
+        let chunk = try XCTUnwrap(bridge.dequeueChunk(withMaximumFrameCount: 4))
+        XCTAssertEqual(floatArray(from: chunk.data), [3, -3, 4, -4])
+    }
+
+    func testTerminalFailuresNeverTriggerAutomaticReconnect() {
+        XCTAssertTrue(RelayError.outputChanged.allowsAutomaticReconnect)
+        XCTAssertTrue(RelayError.spotifyProcessChanged.allowsAutomaticReconnect)
+        XCTAssertFalse(RelayError.cleanupFailed("ownership retained").allowsAutomaticReconnect)
+        XCTAssertFalse(RelayError.rendererFailed("terminal failure").allowsAutomaticReconnect)
+    }
+
     func testSpotifyProcessMatcherAcceptsMainAppAndHelpers() {
         XCTAssertTrue(
             SpotifyProcessMatcher.matches(
@@ -197,7 +232,7 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testApplicationBundleContainsStablePrivacyIdentity() {
-        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.shevlfs.SpatialRelay")
+        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.srode.SpatialRelay")
         XCTAssertNotNil(Bundle.main.object(forInfoDictionaryKey: "NSAudioCaptureUsageDescription"))
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundlePackageType") as? String, "APPL")
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") as? String, "AppIcon")

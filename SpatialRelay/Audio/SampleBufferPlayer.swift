@@ -15,6 +15,55 @@ enum OutputReconfigurationGrace {
     }
 }
 
+struct OutputRecoveryWindow {
+    private(set) var start: UInt64?
+
+    mutating func begin(at now: UInt64) {
+        if start == nil { start = now }
+    }
+
+    mutating func finish() { start = nil }
+
+    func contains(_ now: UInt64) -> Bool {
+        guard let start else { return false }
+        return OutputReconfigurationGrace.contains(startUptimeNanoseconds: start, nowUptimeNanoseconds: now)
+    }
+}
+
+enum LivePlaybackPolicy {
+    static let activePollMilliseconds = 8
+    static let idlePollMilliseconds = 80
+    static let idleAfterNanoseconds: UInt64 = 500_000_000
+    static let maximumBufferedSeconds = 0.35
+
+    static func shouldUseIdlePolling(lastSignal: UInt64, now: UInt64) -> Bool {
+        now >= lastSignal && now - lastSignal >= idleAfterNanoseconds
+    }
+
+    static func needsResynchronization(captured: UInt32, queued: Int64, sampleRate: Double) -> Bool {
+        Double(captured) + Double(max(0, queued)) > sampleRate * maximumBufferedSeconds
+    }
+}
+
+/// Repeated resynchronization indicates a broken output, rather than a single
+/// scheduling interruption. Stop and unmute instead of silently looping forever.
+struct ResynchronizationBudget {
+    private var attempts: [UInt64] = []
+
+    mutating func record(at now: UInt64) -> Bool {
+        attempts.removeAll { now >= $0 && now - $0 >= 30_000_000_000 }
+        guard attempts.count < 3 else { return false }
+        attempts.append(now)
+        return true
+    }
+}
+
+struct PlaybackBufferStatus: Sendable {
+    let queuedFrames: Int64
+    let resynchronizationCount: UInt64
+    let isIdlePolling: Bool
+}
+
 enum RendererRecoveryTimeline {
     static func restartFrame(
         currentTime: CMTime,
@@ -63,13 +112,18 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private var timelineIsRunning = false
     private var backpressureStartTime: DispatchTime?
     private var pauseTransitionStartTime: DispatchTime?
-    private var lastRendererConfigurationChangeTime: DispatchTime?
+    private var recoveryWindow = OutputRecoveryWindow()
     private var rendererRecoveryIsActive = false
     private var formatRecoveryStartTime: DispatchTime?
     private var capturedFramesAtFormatMismatch: UInt64 = 0
     private var observedFormatMismatchCount: UInt64 = 0
     private var failureWasDelivered = false
     private var isStarted = false
+    private var lastSignalFrameCount: UInt64 = 0
+    private var lastSignalTime = DispatchTime.now()
+    private var isIdlePolling = false
+    private var resynchronizationCount: UInt64 = 0
+    private var resynchronizationBudget = ResynchronizationBudget()
 
     init(
         capture: SRAudioCaptureBridge,
@@ -106,11 +160,16 @@ final class SampleBufferPlayer: @unchecked Sendable {
             timelineIsRunning = false
             backpressureStartTime = nil
             pauseTransitionStartTime = nil
-            lastRendererConfigurationChangeTime = nil
+            recoveryWindow.finish()
             rendererRecoveryIsActive = false
             formatRecoveryStartTime = nil
             capturedFramesAtFormatMismatch = 0
             observedFormatMismatchCount = 0
+            lastSignalFrameCount = capture.signalFrameCount
+            lastSignalTime = .now()
+            isIdlePolling = false
+            resynchronizationCount = 0
+            resynchronizationBudget = ResynchronizationBudget()
 
             // Audio-only renderers default to multichannel spatialization. This explicit
             // opt-in is what makes ordinary two-channel PCM eligible for Spatialize Stereo.
@@ -152,7 +211,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             enqueuedFrameCount = 0
             backpressureStartTime = nil
             pauseTransitionStartTime = nil
-            lastRendererConfigurationChangeTime = nil
+            recoveryWindow.finish()
             rendererRecoveryIsActive = false
             formatRecoveryStartTime = nil
             capturedFramesAtFormatMismatch = 0
@@ -165,16 +224,49 @@ final class SampleBufferPlayer: @unchecked Sendable {
     /// reconfiguration from being mistaken for a disconnected device.
     func isWithinOutputReconfigurationGracePeriod() -> Bool {
         performSync {
-            guard let start = lastRendererConfigurationChangeTime else { return false }
-            return OutputReconfigurationGrace.contains(
-                startUptimeNanoseconds: start.uptimeNanoseconds,
-                nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            recoveryWindow.contains(DispatchTime.now().uptimeNanoseconds)
+        }
+    }
+
+    func bufferStatus() -> PlaybackBufferStatus {
+        performSync {
+            PlaybackBufferStatus(
+                queuedFrames: queuedFrameCount(),
+                resynchronizationCount: resynchronizationCount,
+                isIdlePolling: isIdlePolling
             )
         }
     }
 
+    private func queuedFrameCount() -> Int64 {
+        guard timelineIsRunning else { return enqueuedFrameCount }
+        let playhead = CMTimeConvertScale(synchronizer.currentTime(), timescale: timeScale, method: .roundTowardNegativeInfinity)
+        return playhead.isNumeric ? max(0, nextFrame - playhead.value) : enqueuedFrameCount
+    }
+
+    private func updatePolling() {
+        guard isStarted, !failureWasDelivered else { return }
+        let signalCount = capture.signalFrameCount
+        let now = DispatchTime.now()
+        if signalCount != lastSignalFrameCount {
+            lastSignalFrameCount = signalCount
+            lastSignalTime = now
+        }
+        let idle = LivePlaybackPolicy.shouldUseIdlePolling(lastSignal: lastSignalTime.uptimeNanoseconds, now: now.uptimeNanoseconds)
+        guard idle != isIdlePolling else { return }
+        isIdlePolling = idle
+        let interval = idle ? LivePlaybackPolicy.idlePollMilliseconds : LivePlaybackPolicy.activePollMilliseconds
+        timer?.schedule(deadline: .now() + .milliseconds(interval), repeating: .milliseconds(interval), leeway: .milliseconds(idle ? 10 : 2))
+    }
+
     private func pump() {
         guard isStarted && !failureWasDelivered else { return }
+        defer { updatePolling() }
+
+        if rendererRecoveryIsActive, !recoveryWindow.contains(DispatchTime.now().uptimeNanoseconds) {
+            deliverFailure(RelayError.rendererFailed("the output did not recover within five seconds"))
+            return
+        }
 
         if renderer.status == .failed {
             // AVQueuedSampleBufferRenderingStatus.failed is terminal. Normal
@@ -225,8 +317,28 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
         if rendererRecoveryIsActive,
            timelineIsRunning,
-           abs(synchronizer.rate - 1) < 0.000_1 {
+           abs(synchronizer.rate - 1) < 0.000_1,
+           CMTimeCompare(synchronizer.currentTime(), mediaTime(forFrame: segmentStartFrame + prebufferFrameCount)) >= 0 {
             rendererRecoveryIsActive = false
+            recoveryWindow.finish()
+        }
+
+        if LivePlaybackPolicy.needsResynchronization(
+            captured: capture.availableFrameCount,
+            queued: queuedFrameCount(),
+            sampleRate: sampleRate
+        ) {
+            guard resynchronizationBudget.record(at: DispatchTime.now().uptimeNanoseconds) else {
+                deliverFailure(RelayError.rendererFailed("audio repeatedly exceeded the 350 ms live-buffer limit"))
+                return
+            }
+            // Flush old queued audio and keep only a fresh startup buffer. Only
+            // this consumer moves the read cursor; the HAL producer stays live.
+            let playhead = synchronizer.currentTime()
+            resetTimeline(at: playhead.isNumeric ? playhead : mediaTime(forFrame: nextFrame))
+            _ = capture.discardFramesKeepingLatest(UInt32(prebufferFrameCount))
+            resynchronizationCount += 1
+            return
         }
 
         // If the control queue was delayed while Spotify was silent, the
@@ -323,7 +435,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
     /// stop the relay. Keep captured PCM in the ring, rebase, and prebuffer it.
     private func recoverRendererAfterConfigurationChange(suggestedFlushTime: CMTime? = nil) {
         guard isStarted && !failureWasDelivered else { return }
-        lastRendererConfigurationChangeTime = .now()
+        // Paired or repeated notifications must not renew the five-second limit.
+        recoveryWindow.begin(at: DispatchTime.now().uptimeNanoseconds)
 
         // OutputConfigurationDidChange and WasFlushedAutomatically commonly
         // arrive as a pair. If the first notification is still waiting for the

@@ -26,6 +26,25 @@ struct SpatialRelayApp: App {
     @StateObject private var viewModel: RelayViewModel
 
     init() {
+        if CommandLine.arguments.contains("--diagnostics") {
+            // Read-only diagnostics: never creates a tap or starts a renderer.
+            print("Spatial Relay Local \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown")")
+            print("Identity: \(Bundle.main.bundleIdentifier ?? "unknown")")
+            do {
+                let discovery = try AudioRelayCoordinator().discover()
+                print("Spotify audio processes: \(discovery.spotifyProcesses.count)")
+                if let output = discovery.outputDevice {
+                    print("Output: \(output.name), \(output.sampleRate) Hz")
+                } else {
+                    print("Output: unavailable")
+                }
+                print("No audio capture was started. Spatial Audio availability requires a playback test.")
+                exit(0)
+            } catch {
+                print("Discovery failed: \(error.localizedDescription)")
+                exit(1)
+            }
+        }
         let viewModel = RelayViewModel()
         _viewModel = StateObject(wrappedValue: viewModel)
         appDelegate.viewModel = viewModel

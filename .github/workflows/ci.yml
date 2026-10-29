@@ -46,6 +46,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             test
 
+      - name: Test capture concurrency and live playback policies under sanitizers
+        run: Scripts/test-core.sh
+
       - name: Run static analysis
         run: |
           xcodebuild -quiet \
