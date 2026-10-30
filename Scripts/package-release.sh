@@ -41,10 +41,14 @@ xcodebuild -quiet \
   -derivedDataPath "$DERIVED_DATA_PATH" \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=NO \
+  CLANG_ENABLE_CODE_COVERAGE=NO \
+  GCC_GENERATE_TEST_COVERAGE_FILES=NO \
+  GCC_INSTRUMENT_PROGRAM_FLOW_ARCS=NO \
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY=- \
   CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
   DEVELOPMENT_TEAM= \
+  -enableCodeCoverage NO \
   build
 
 SOURCE_APP="$DERIVED_DATA_PATH/Build/Products/Release/SpatialRelay.app"
@@ -56,6 +60,11 @@ CHECKSUM="$ARCHIVE.sha256"
 test -d "$SOURCE_APP"
 lipo "$EXECUTABLE" -verify_arch arm64
 codesign --verify --deep --strict --verbose=2 "$SOURCE_APP"
+nm "$EXECUTABLE" > "$STAGING_DIR/symbols.txt"
+if /usr/bin/grep -Eq "__llvm_(profile|prf)|__profc_" "$STAGING_DIR/symbols.txt"; then
+  printf "Release contains coverage instrumentation.\n" >&2
+  exit 1
+fi
 
 BUNDLE_VERSION="$(
   /usr/libexec/PlistBuddy \

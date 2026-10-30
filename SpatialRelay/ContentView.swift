@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var viewModel: RelayViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -24,7 +25,8 @@ struct ContentView: View {
         }
         .padding(28)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { viewModel.refresh() }
+        .onAppear { viewModel.setPanelVisible(true) }
+        .onDisappear { viewModel.setPanelVisible(false) }
     }
 
     private var header: some View {
@@ -125,6 +127,7 @@ struct ContentView: View {
                 Text(viewModel.latencyLabel)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .help("Audio queued inside the relay. Device, Bluetooth, and spatial-processing latency are additional. A resync discards stale audio after an interruption.")
             }
 
             GeometryReader { proxy in
@@ -139,7 +142,7 @@ struct ContentView: View {
                             )
                         )
                         .frame(width: max(4, proxy.size.width * viewModel.meterLevel))
-                        .animation(.linear(duration: 0.12), value: viewModel.meterLevel)
+                        .animation(reduceMotion ? nil : .linear(duration: 0.12), value: viewModel.meterLevel)
                 }
             }
             .frame(height: 8)
@@ -173,14 +176,16 @@ struct ContentView: View {
             } label: {
                 Label("Open Spotify", systemImage: "arrow.up.forward.app")
             }
-            .disabled(viewModel.isBusy || viewModel.isRelaying)
+            .disabled(viewModel.isBusy || viewModel.isRelayRequested)
+            .keyboardShortcut("o", modifiers: [.command, .shift])
 
             Button {
                 viewModel.refresh()
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
-            .disabled(viewModel.isBusy || viewModel.isRelaying)
+            .disabled(viewModel.isBusy || viewModel.isRelayRequested)
+            .keyboardShortcut("r")
 
             Menu {
                 Button("Quit Spatial Relay", systemImage: "power") {
@@ -192,6 +197,7 @@ struct ContentView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel("More actions")
 
             Spacer()
 
@@ -202,13 +208,13 @@ struct ContentView: View {
                     ProgressView().controlSize(.small)
                         .frame(minWidth: 92)
                 } else {
-                    Text(viewModel.isRelaying ? "Stop relay" : "Start relay")
+                    Text(viewModel.isRelayRequested ? "Stop relay" : "Start relay")
                         .frame(minWidth: 92)
                 }
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .tint(viewModel.isRelaying ? .red : .accentColor)
+            .tint(viewModel.isRelayRequested ? .red : .accentColor)
             .disabled(!viewModel.canToggleRelay)
             .keyboardShortcut(.return, modifiers: [])
         }

@@ -10,6 +10,19 @@ struct RelayMetrics: Sendable {
     let peakLevel: Float
     let bufferedMilliseconds: Double
     let droppedFrameCount: UInt64
+    let resynchronizationCount: UInt64
+    let isIdlePolling: Bool
+    let diagnostic: String
+}
+
+enum RelayRouteEvent: Sendable {
+    case waiting(String)
+    case resumed(RelayDiscovery)
+}
+
+struct RelayRouteUpdate: Sendable {
+    let revision: UInt64
+    let event: RelayRouteEvent
 }
 
 final class AudioRelayCoordinator: @unchecked Sendable {
@@ -29,6 +42,14 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     private var sampleRateMismatchStartTime: DispatchTime?
 
     private var isActive = false
+    private var generation = RelayGeneration()
+    private var healthTimer: DispatchSourceTimer?
+    private var failureHandler: (@Sendable (Error) -> Void)?
+    private var routeHandler: (@Sendable (RelayRouteUpdate) -> Void)?
+    private var routeRevision: UInt64 = 0
+    private var reconnectAttempts = 0
+    private var lastWaitingMessage: String?
+    private var reconnectOutputUIDs = Set<String>()
 
     init() {
         controlQueue.setSpecific(key: controlQueueKey, value: 1)
@@ -48,9 +69,25 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     }
 
     @discardableResult
-    func start(onFailure: @escaping @Sendable (Error) -> Void) throws -> RelayDiscovery {
+    func start(
+        onFailure: @escaping @Sendable (Error) -> Void,
+        onRouteEvent: @escaping @Sendable (RelayRouteUpdate) -> Void
+    ) throws -> RelayDiscovery {
         try performSync {
-            try startPipeline(onFailure: onFailure)
+            stopMonitoring()
+            let discovery = try startPipeline(onFailure: onFailure)
+            failureHandler = onFailure
+            routeHandler = onRouteEvent
+            routeRevision = 0
+            reconnectAttempts = 0
+            lastWaitingMessage = nil
+            if let output = discovery.outputDevice { reconnectOutputUIDs.insert(output.uid) }
+            let timer = DispatchSource.makeTimerSource(queue: controlQueue)
+            timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(100))
+            timer.setEventHandler { [weak self] in self?.checkHealthAndReconnect() }
+            healthTimer = timer
+            timer.resume()
+            return discovery
         }
     }
 
@@ -81,6 +118,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             aggregateID = try hardware.createAggregateDevice(tapUID: uid)
 
             let capture = SRAudioCaptureBridge()
+            let pipelineToken = generation.value
             let player = try SampleBufferPlayer(
                 capture: capture,
                 sampleRate: format.mSampleRate,
@@ -88,10 +126,18 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             ) { [weak self] error in
                 guard let self else { return }
                 self.controlQueue.async { [weak self] in
-                    guard let self, self.isActive else { return }
+                    guard let self, self.isActive, self.generation.accepts(pipelineToken) else { return }
+                    let routeChanged = self.outputRouteChanged()
                     // Flush playback before stopping the tap, then immediately release
                     // mutedWhenTapped so Spotify's direct output is restored.
                     let cleanupFailure = self.stopPipeline()
+                    if routeChanged, cleanupFailure == nil {
+                        let reason = RelayError.outputChanged.localizedDescription
+                        self.reconnectAttempts = 0
+                        self.emitRouteEvent(.waiting(reason))
+                        return
+                    }
+                    self.stopMonitoring()
                     DispatchQueue.main.async {
                         onFailure(cleanupFailure ?? error)
                     }
@@ -101,13 +147,14 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             self.capture = capture
             self.player = player
 
+            // Prepare AVFoundation before muting/capturing Spotify, so device
+            // setup cannot accumulate old PCM before the first pump runs.
+            player.start()
             do {
                 try capture.startCapturingDevice(aggregateID, format: format)
             } catch {
                 throw RelayError.captureFailed(error.localizedDescription)
             }
-            player.start()
-
             activeOutput = output
             activeProcessIDs = Set(processes.map(\.id))
             activeSampleRate = format.mSampleRate
@@ -129,11 +176,91 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     @discardableResult
     func stop() -> Error? {
         performSync {
-            stopPipeline()
+            stopMonitoring()
+            return stopPipeline()
         }
     }
 
+    private func stopMonitoring() {
+        healthTimer?.setEventHandler {}
+        healthTimer?.cancel()
+        healthTimer = nil
+        failureHandler = nil
+        routeHandler = nil
+        lastWaitingMessage = nil
+        reconnectOutputUIDs.removeAll()
+    }
+
+    /// Runs off the main actor, including while the panel is hidden or AppKit
+    /// is busy. Direct Spotify output is restored before requesting any retry.
+    private func checkHealthAndReconnect() {
+        if isActive {
+            guard let failure = healthFailureLocked() else { return }
+            let canReconnect = (failure as? RelayError)?.allowsAutomaticReconnect == true
+            let cleanupFailure = stopPipeline()
+            if let cleanupFailure {
+                finishWithFailure(cleanupFailure)
+                return
+            }
+            guard canReconnect else {
+                finishWithFailure(failure)
+                return
+            }
+            emitRouteEvent(.waiting(failure.localizedDescription))
+            reconnectAttempts = 0
+        }
+
+        guard let onFailure = failureHandler else { return }
+        do {
+            let discovery = try discover()
+            let reason: String?
+            if discovery.outputDevice.map({ $0.isLikelySpatialAudioHeadphones || reconnectOutputUIDs.contains($0.uid) }) != true {
+                reason = "Waiting for AirPods. Spotify plays directly; Stop relay cancels reconnection."
+            } else if discovery.spotifyProcesses.isEmpty {
+                reason = "Waiting for Spotify. Stop relay cancels reconnection."
+            } else {
+                reason = nil
+            }
+            if let reason {
+                if reason != lastWaitingMessage { emitRouteEvent(.waiting(reason)) }
+                lastWaitingMessage = reason
+                return
+            }
+            let resumed = try startPipeline(onFailure: onFailure)
+            if let output = resumed.outputDevice { reconnectOutputUIDs.insert(output.uid) }
+            lastWaitingMessage = nil
+            reconnectAttempts = 0
+            emitRouteEvent(.resumed(resumed))
+        } catch {
+            reconnectAttempts += 1
+            if reconnectAttempts >= 3 || (error as? RelayError).map({
+                if case .cleanupFailed = $0 { return true }; return false
+            }) == true {
+                finishWithFailure(error)
+            }
+        }
+    }
+
+    private func finishWithFailure(_ error: Error) {
+        let callback = failureHandler
+        stopMonitoring()
+        callback?(error)
+    }
+
+    private func emitRouteEvent(_ event: RelayRouteEvent) {
+        routeRevision += 1
+        routeHandler?(RelayRouteUpdate(revision: routeRevision, event: event))
+    }
+
+    private func outputRouteChanged() -> Bool {
+        guard let activeOutput else { return false }
+        guard let output = try? hardware.defaultOutputDevice() else { return true }
+        return output.id != activeOutput.id || output.uid != activeOutput.uid ||
+            abs(output.sampleRate - activeOutput.sampleRate) > 0.5
+    }
+
     private func stopPipeline() -> Error? {
+        generation.advance()
         isActive = false
         return tearDownPipeline()
     }
@@ -141,13 +268,17 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     func metrics() -> RelayMetrics {
         performSync {
             guard let capture, activeSampleRate > 0 else {
-                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0)
+                return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0, resynchronizationCount: 0, isIdlePolling: false, diagnostic: "stopped")
             }
-            let buffered = Double(capture.availableFrameCount) / activeSampleRate * 1_000
+            let playback = player?.bufferStatus()
+            let buffered = (Double(capture.availableFrameCount) + Double(playback?.queuedFrames ?? 0)) / activeSampleRate * 1_000
             return RelayMetrics(
                 peakLevel: capture.peakLevel,
                 bufferedMilliseconds: buffered,
-                droppedFrameCount: capture.droppedFrameCount
+                droppedFrameCount: capture.droppedFrameCount,
+                resynchronizationCount: playback?.resynchronizationCount ?? 0,
+                isIdlePolling: playback?.isIdlePolling ?? false,
+                diagnostic: "capture=\(capture.availableFrameCount) renderer=\(playback?.queuedFrames ?? 0) rate=\(playback?.timebaseRate ?? 0) playhead=\(playback?.playheadSeconds ?? 0) sufficient=\(playback?.hasSufficientData ?? false)"
             )
         }
     }
@@ -165,15 +296,11 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         guard isActive, let activeOutput else { return nil }
         let isWithinOutputGrace = player?.isWithinOutputReconfigurationGracePeriod() == true
 
-        guard capture?.isCapturing == true else {
-            return RelayError.captureFailed("the Core Audio callback stopped")
-        }
-
         do {
             let output = try hardware.defaultOutputDevice()
             if output.id != activeOutput.id || output.uid != activeOutput.uid {
                 if !isWithinOutputGrace {
-                    return RelayError.rendererFailed("the default output route changed")
+                    return RelayError.outputChanged
                 }
             }
 
@@ -181,7 +308,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 if let sampleRateMismatchStartTime {
                     if !isWithinOutputGrace,
                        elapsedMilliseconds(since: sampleRateMismatchStartTime) > OutputReconfigurationGrace.durationMilliseconds {
-                        return RelayError.rendererFailed("the output sample rate changed")
+                        return RelayError.outputChanged
                     }
                 } else {
                     sampleRateMismatchStartTime = .now()
@@ -190,15 +317,19 @@ final class AudioRelayCoordinator: @unchecked Sendable {
                 sampleRateMismatchStartTime = nil
             }
 
+            guard capture?.isCapturing == true else {
+                return outputRouteChanged() ? RelayError.outputChanged : RelayError.captureFailed("the Core Audio callback stopped")
+            }
+
             let processes = try hardware.spotifyProcesses()
             let processIDs = Set(processes.map(\.id))
             if activeProcessIDs.isDisjoint(with: processIDs) {
-                return RelayError.captureFailed("Spotify replaced its audio process")
+                return RelayError.spotifyProcessChanged
             }
 
             let runningOutputIDs = Set(processes.filter(\.isRunningOutput).map(\.id))
             if !runningOutputIDs.isEmpty && !runningOutputIDs.isSubset(of: activeProcessIDs) {
-                return RelayError.captureFailed("Spotify moved playback to a new audio process")
+                return RelayError.spotifyProcessChanged
             }
 
             if !runningOutputIDs.isEmpty, let capture {
@@ -226,6 +357,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             if isWithinOutputGrace {
                 return nil
             }
+            if outputRouteChanged() { return RelayError.outputChanged }
             return error
         }
         return nil
@@ -235,6 +367,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         // Order matters: discard queued relay audio, stop reading (which un-mutes
         // Spotify), then destroy the aggregate device and process tap.
         var cleanupProblems: [String] = []
+        let diagnostics = player?.diagnosticReport()
 
         player?.stop()
         player = nil
@@ -296,6 +429,10 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         lastCapturedFrameCount = 0
         stalledCaptureChecks = 0
         sampleRateMismatchStartTime = nil
+
+        // Write only numeric timing/counter metadata, after restoring direct
+        // audio and releasing HAL ownership. Never write PCM or audio content.
+        if let diagnostics { RelayDiagnostics.store(diagnostics) }
 
         guard !cleanupProblems.isEmpty else { return nil }
         return RelayError.cleanupFailed(cleanupProblems.joined(separator: "; "))

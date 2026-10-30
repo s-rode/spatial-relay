@@ -4,6 +4,54 @@ import XCTest
 @testable import SpatialRelay
 
 final class CoreLogicTests: XCTestCase {
+    func testReplacedPipelineRejectsLateFailureToken() {
+        var generation = RelayGeneration()
+        let oldToken = generation.value
+        generation.advance()
+        XCTAssertFalse(generation.accepts(oldToken))
+        XCTAssertTrue(generation.accepts(generation.value))
+    }
+
+    func testRepeatedOutputNotificationsCannotExtendRecoveryDeadline() {
+        var window = OutputRecoveryWindow()
+        window.begin(at: 100)
+        window.begin(at: 4_000_000_100)
+        XCTAssertTrue(window.contains(5_000_000_100))
+        XCTAssertFalse(window.contains(5_000_000_101))
+        window.finish()
+        window.begin(at: 6_000_000_100)
+        XCTAssertTrue(window.contains(7_000_000_100))
+    }
+
+    func testLatencyGuardAllowsNativePrimingAndBoundsGrowth() {
+        var monitor = LiveBufferMonitor()
+        for step in 1...100 {
+            XCTAssertEqual(monitor.action(captured: 0, queued: Int64(step * 480), sampleRate: 48_000, playbackHasAdvanced: false), .none)
+        }
+        XCTAssertEqual(monitor.action(captured: 0, queued: 48_000, sampleRate: 48_000, playbackHasAdvanced: true), .none)
+        XCTAssertEqual(monitor.action(captured: 0, queued: 64_801, sampleRate: 48_000, playbackHasAdvanced: true), .resetRenderer)
+        XCTAssertEqual(monitor.action(captured: 20_000, queued: 0, sampleRate: 48_000, playbackHasAdvanced: false), .trimCapture)
+        XCTAssertEqual(monitor.action(captured: 0, queued: 144_001, sampleRate: 48_000, playbackHasAdvanced: false), .stop)
+    }
+
+    func testDiscardKeepsNewestFramesWithoutResettingCapture() throws {
+        let bridge = SRAudioCaptureBridge()
+        let input: [Float] = [1, -1, 2, -2, 3, -3, 4, -4]
+        bridge.debugEnqueueInterleavedFloat(input.withUnsafeBytes { Data($0) })
+        XCTAssertEqual(bridge.discardFramesKeepingLatest(2), 2)
+        XCTAssertEqual(bridge.capturedFrameCount, 4)
+        XCTAssertEqual(bridge.discardedFrameCount, 2)
+        let chunk = try XCTUnwrap(bridge.dequeueChunk(withMaximumFrameCount: 4))
+        XCTAssertEqual(floatArray(from: chunk.data), [3, -3, 4, -4])
+    }
+
+    func testTerminalFailuresNeverTriggerAutomaticReconnect() {
+        XCTAssertTrue(RelayError.outputChanged.allowsAutomaticReconnect)
+        XCTAssertTrue(RelayError.spotifyProcessChanged.allowsAutomaticReconnect)
+        XCTAssertFalse(RelayError.cleanupFailed("ownership retained").allowsAutomaticReconnect)
+        XCTAssertFalse(RelayError.rendererFailed("terminal failure").allowsAutomaticReconnect)
+    }
+
     func testSpotifyProcessMatcherAcceptsMainAppAndHelpers() {
         XCTAssertTrue(
             SpotifyProcessMatcher.matches(
@@ -197,7 +245,7 @@ final class CoreLogicTests: XCTestCase {
     }
 
     func testApplicationBundleContainsStablePrivacyIdentity() {
-        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.shevlfs.SpatialRelay")
+        XCTAssertEqual(Bundle.main.bundleIdentifier, "com.srode.SpatialRelay")
         XCTAssertNotNil(Bundle.main.object(forInfoDictionaryKey: "NSAudioCaptureUsageDescription"))
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundlePackageType") as? String, "APPL")
         XCTAssertEqual(Bundle.main.object(forInfoDictionaryKey: "CFBundleIconName") as? String, "AppIcon")

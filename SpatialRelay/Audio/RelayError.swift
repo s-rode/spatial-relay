@@ -9,6 +9,15 @@ enum RelayError: LocalizedError {
     case rendererFailed(String)
     case captureFailed(String)
     case cleanupFailed(String)
+    case outputChanged
+    case spotifyProcessChanged
+
+    var allowsAutomaticReconnect: Bool {
+        switch self {
+        case .outputChanged, .spotifyProcessChanged: true
+        default: false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -28,6 +37,10 @@ enum RelayError: LocalizedError {
             "Spotify audio capture failed (\(detail))."
         case .cleanupFailed(let detail):
             "Spatial Relay could not fully release the audio tap (\(detail)). It attempted to restore Spotify output; quit the app before retrying."
+        case .outputChanged:
+            "The audio output changed. Spotify is playing directly while the relay reconnects."
+        case .spotifyProcessChanged:
+            "Spotify changed its audio process. The relay is reconnecting."
         }
     }
 }

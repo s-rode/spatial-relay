@@ -29,6 +29,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) UInt64 formatMismatchCount;
 @property(nonatomic, readonly) UInt64 callbackCount;
 @property(nonatomic, readonly) UInt64 capturedFrameCount;
+@property(nonatomic, readonly) UInt64 signalFrameCount;
+@property(nonatomic, readonly) UInt64 discardedFrameCount;
 @property(nonatomic, readonly) float peakLevel;
 
 - (BOOL)startCapturingDevice:(AudioObjectID)deviceID
@@ -40,6 +42,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Call only from one non-real-time consumer queue.
 - (nullable SRPCMChunk *)dequeueChunkWithMaximumFrameCount:(UInt32)maximumFrameCount;
+
+/// Consumer-only: discard stale PCM without resetting or stopping the producer.
+- (UInt32)discardFramesKeepingLatest:(UInt32)frameCount;
 
 #if DEBUG
 /// Deterministic unit-test hook. Never used by the app's relay path.
