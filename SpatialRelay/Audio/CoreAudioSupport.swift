@@ -7,6 +7,26 @@ struct RelayGeneration {
     func accepts(_ token: UInt64) -> Bool { token == value }
 }
 
+enum RelayDiagnostics {
+    static var fileURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SpatialRelayLocal", isDirectory: true)
+            .appendingPathComponent("last-playback.json")
+    }
+
+    static func store(_ data: Data) {
+        do {
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            // Reporting failure must never keep a process tap active.
+            print("Could not save playback timing diagnostics: \(error.localizedDescription)")
+        }
+    }
+
+    static func load() throws -> Data { try Data(contentsOf: fileURL) }
+}
+
 struct CoreAudioFailure: LocalizedError, Equatable {
     let operation: String
     let status: OSStatus

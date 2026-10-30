@@ -9,11 +9,11 @@ Scripts/test-core.sh
 Scripts/build-local.sh
 ```
 
-The result is `build/local/Spatial Relay Local.app`, version 0.3.0, with its own privacy identity (`com.srode.SpatialRelay`). It is sandboxed and ad-hoc signed, with hardened runtime enabled. It is not notarized. The script does not install it, remove quarantine, or change macOS security settings. Full Xcode builds and the original XCTest suite are still supported.
+The result is `build/local/Spatial Relay Local.app`, version 0.3.1, with its own privacy identity (`com.srode.SpatialRelay`). It is sandboxed and ad-hoc signed, with hardened runtime enabled. It is not notarized. The script does not install it, remove quarantine, or change macOS security settings. Full Xcode builds and the original XCTest suite are still supported.
 
 Changes in this fork:
 
-- At more than 350 ms of audio in the capture and renderer queues together, discard stale audio and restart from a fresh startup buffer. This can skip a brief passage after an interruption. Three resyncs are allowed per 30 seconds; further trouble stops the relay and restores direct playback.
+- Trim captured audio older than 350 ms to a recent startup buffer without flushing legitimate renderer priming data. Once playback starts, monitor growth above the lowest observed renderer queue; 350 ms of additional growth triggers a resync. Renderer buffering is capped at three seconds, and its clock must start within five seconds. Three resyncs are allowed per 30 seconds; further trouble stops the relay and restores direct playback. An interruption can cause a brief skipped passage. These are queue-recovery bounds, not an end-to-end latency guarantee.
 - After 500 ms without nonzero audio samples, poll every 80 ms instead of 8 ms. Resume the faster cadence when signal returns. This can add up to one idle polling interval to playback resumption.
 - Sample the meter only while the panel is visible. Run health checks once per second on a background control queue, including with the panel closed.
 - Restore direct playback before rebuilding after an output or Spotify-process change. If compatible-looking headphones or Spotify are absent, wait with direct playback enabled. Stop relay cancels waiting. Failed rebuilds stop after three attempts; unsafe cleanup failures are never retried automatically.
@@ -104,3 +104,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security r
 Spatial Relay is open source under the [MIT License](LICENSE).
 
 Spotify, AirPods, Spatial Audio, macOS, and Apple are trademarks of their respective owners. This project is independent and is not affiliated with, endorsed by, or sponsored by Spotify or Apple.
+
+Local timing diagnostics
+------------------------
+
+After a relay stops, its sandbox stores a small `SpatialRelayLocal/last-playback.json` report in Application Support. It contains only frame counters, queue sizes, clock/rate values, and any failure reason; no PCM, song metadata, or audio recording. Nothing is uploaded. Run the app executable with `--last-run` to print the latest report. This makes actual playback failures distinguishable from renderer startup and silent input.
+
+`Scripts/test-renderer.sh` is an explicit hardware integration check, separate from the device-free tests. It plays a six-second synthetic stereo signal hard-limited to -100 dBFS through the current output, without changing system volume or capturing another app. Do not run it as part of a silent/background CI job.

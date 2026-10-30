@@ -24,19 +24,30 @@ struct PlaybackPolicyTests {
         precondition(recovery.contains(start + 14_000_000_000))
         print("PASS: bounded recovery across repeated notifications and a later independent recovery")
 
-        precondition(!LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 16_800, sampleRate: 48_000))
-        precondition(LivePlaybackPolicy.needsResynchronization(captured: 1, queued: 16_800, sampleRate: 48_000))
-        precondition(LivePlaybackPolicy.needsResynchronization(captured: 96_000, queued: 0, sampleRate: 48_000))
-        // Both queues count: an empty capture ring cannot hide stale renderer PCM.
-        precondition(LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 96_000, sampleRate: 48_000))
-        precondition(LivePlaybackPolicy.needsResynchronization(captured: 8_000, queued: 9_000, sampleRate: 48_000))
-        precondition(!LivePlaybackPolicy.needsResynchronization(captured: 3_840, queued: -100, sampleRate: 48_000))
-        precondition(LivePlaybackPolicy.needsResynchronization(captured: 15_436, queued: 0, sampleRate: 44_100))
+        var monitor = LiveBufferMonitor()
+        // Regression: a renderer requiring one second to prime must be able to
+        // reach that threshold, rather than being flushed every 350 ms.
+        for step in 1...100 {
+            precondition(monitor.action(captured: 0, queued: Int64(step * 480), sampleRate: 48_000, playbackHasAdvanced: false) == .none)
+        }
+        for _ in 1...100 {
+            precondition(monitor.action(captured: 0, queued: 48_000, sampleRate: 48_000, playbackHasAdvanced: true) == .none)
+        }
+        precondition(monitor.action(captured: 0, queued: 64_800, sampleRate: 48_000, playbackHasAdvanced: true) == .none)
+        precondition(monitor.action(captured: 0, queued: 64_801, sampleRate: 48_000, playbackHasAdvanced: true) == .resetRenderer)
+        var captureBacklog = LiveBufferMonitor()
+        precondition(captureBacklog.action(captured: 16_800, queued: 48_000, sampleRate: 48_000, playbackHasAdvanced: false) == .none)
+        precondition(captureBacklog.action(captured: 16_801, queued: 48_000, sampleRate: 48_000, playbackHasAdvanced: false) == .trimCapture)
+        precondition(captureBacklog.baselineRendererFrames == nil)
+        precondition(captureBacklog.action(captured: 0, queued: 144_001, sampleRate: 48_000, playbackHasAdvanced: false) == .stop)
+        var rate441 = LiveBufferMonitor()
+        precondition(rate441.action(captured: 15_436, queued: 0, sampleRate: 44_100, playbackHasAdvanced: false) == .trimCapture)
+        print("PASS: native startup priming, stable native latency, excess growth, capture trimming and hard renderer bound")
         precondition(LivePlaybackPolicy.idlePollMilliseconds > LivePlaybackPolicy.activePollMilliseconds)
         precondition(!LivePlaybackPolicy.shouldUseIdlePolling(lastSignal: 1, now: 500_000_000))
         precondition(LivePlaybackPolicy.shouldUseIdlePolling(lastSignal: 1, now: 500_000_001))
         precondition(!LivePlaybackPolicy.shouldUseIdlePolling(lastSignal: 100, now: 99))
-        print("PASS: 350 ms boundary, combined capture/renderer backlog, 44.1/48 kHz policies")
+        print("PASS: silent polling boundaries and backwards-clock protection")
 
         var budget = ResynchronizationBudget()
         precondition(budget.record(at: 0))

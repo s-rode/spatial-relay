@@ -26,6 +26,16 @@ struct SpatialRelayApp: App {
     @StateObject private var viewModel: RelayViewModel
 
     init() {
+        if CommandLine.arguments.contains("--last-run") {
+            do {
+                let data = try RelayDiagnostics.load()
+                print(String(decoding: data, as: UTF8.self))
+                exit(0)
+            } catch {
+                print("No playback diagnostic report is available: \(error.localizedDescription)")
+                exit(1)
+            }
+        }
         if CommandLine.arguments.contains("--diagnostics") {
             // Read-only diagnostics: never creates a tap or starts a renderer.
             print("Spatial Relay Local \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown")")

@@ -367,6 +367,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         // Order matters: discard queued relay audio, stop reading (which un-mutes
         // Spotify), then destroy the aggregate device and process tap.
         var cleanupProblems: [String] = []
+        let diagnostics = player?.diagnosticReport()
 
         player?.stop()
         player = nil
@@ -428,6 +429,10 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         lastCapturedFrameCount = 0
         stalledCaptureChecks = 0
         sampleRateMismatchStartTime = nil
+
+        // Write only numeric timing/counter metadata, after restoring direct
+        // audio and releasing HAL ownership. Never write PCM or audio content.
+        if let diagnostics { RelayDiagnostics.store(diagnostics) }
 
         guard !cleanupProblems.isEmpty else { return nil }
         return RelayError.cleanupFailed(cleanupProblems.joined(separator: "; "))

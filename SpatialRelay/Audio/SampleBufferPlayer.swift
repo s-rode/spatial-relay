@@ -35,14 +35,32 @@ enum LivePlaybackPolicy {
     static let activePollMilliseconds = 8
     static let idlePollMilliseconds = 80
     static let idleAfterNanoseconds: UInt64 = 500_000_000
-    static let maximumBufferedSeconds = 0.35
+    static let maximumCaptureSeconds = 0.35
+    static let maximumRendererSeconds = 3.0
 
     static func shouldUseIdlePolling(lastSignal: UInt64, now: UInt64) -> Bool {
         now >= lastSignal && now - lastSignal >= idleAfterNanoseconds
     }
 
-    static func needsResynchronization(captured: UInt32, queued: Int64, sampleRate: Double) -> Bool {
-        Double(captured) + Double(max(0, queued)) > sampleRate * maximumBufferedSeconds
+}
+
+enum LiveBufferAction: Equatable {
+    case none, trimCapture, resetRenderer, stop
+}
+
+struct LiveBufferMonitor {
+    private(set) var baselineRendererFrames: Int64?
+
+    mutating func action(captured: UInt32, queued: Int64, sampleRate: Double, playbackHasAdvanced: Bool) -> LiveBufferAction {
+        let queued = max(0, queued)
+        if Double(queued) > sampleRate * LivePlaybackPolicy.maximumRendererSeconds { return .stop }
+        if Double(captured) > sampleRate * LivePlaybackPolicy.maximumCaptureSeconds { return .trimCapture }
+        // A native renderer must be allowed to prime before its audio clock
+        // starts. Flushing on a fixed total threshold can prevent startup forever.
+        guard playbackHasAdvanced else { return .none }
+        baselineRendererFrames = min(baselineRendererFrames ?? queued, queued)
+        if Double(queued - (baselineRendererFrames ?? queued)) > sampleRate * 0.35 { return .resetRenderer }
+        return .none
     }
 }
 
@@ -66,6 +84,26 @@ struct PlaybackBufferStatus: Sendable {
     let timebaseRate: Float
     let playheadSeconds: Double
     let hasSufficientData: Bool
+}
+
+private struct PlaybackDiagnosticSample: Codable {
+    let uptimeMilliseconds: UInt64
+    let capturedFrames: UInt64
+    let signalFrames: UInt64
+    let capturedQueueFrames: UInt32
+    let rendererQueueFrames: Int64
+    let playheadSeconds: Double?
+    let requestedRate: Float
+    let actualTimebaseRate: Double
+    let sufficientData: Bool
+    let resynchronizations: UInt64
+}
+
+private struct PlaybackDiagnosticReport: Codable {
+    let createdAt: Date
+    let reason: String
+    let sampleRate: Double
+    let samples: [PlaybackDiagnosticSample]
 }
 
 enum RendererRecoveryTimeline {
@@ -129,6 +167,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private var isIdlePolling = false
     private var resynchronizationCount: UInt64 = 0
     private var resynchronizationBudget = ResynchronizationBudget()
+    private var bufferMonitor = LiveBufferMonitor()
+    private var timelineStartTime: DispatchTime?
+    private var diagnosticSamples: [PlaybackDiagnosticSample] = []
+    private var lastDiagnosticTime: UInt64 = 0
+    private var failureReason: String?
 
     init(
         capture: SRAudioCaptureBridge,
@@ -175,6 +218,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
             isIdlePolling = false
             resynchronizationCount = 0
             resynchronizationBudget = ResynchronizationBudget()
+            bufferMonitor = LiveBufferMonitor()
+            timelineStartTime = nil
+            diagnosticSamples.removeAll(keepingCapacity: true)
+            lastDiagnosticTime = 0
+            failureReason = nil
 
             // Audio-only renderers default to multichannel spatialization. This explicit
             // opt-in is what makes ordinary two-channel PCM eligible for Spatialize Stereo.
@@ -214,6 +262,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             removeRendererObservers()
 
             timelineIsRunning = false
+            timelineStartTime = nil
             nextFrame = 0
             segmentStartFrame = 0
             enqueuedFrameCount = 0
@@ -249,6 +298,34 @@ final class SampleBufferPlayer: @unchecked Sendable {
         }
     }
 
+    func diagnosticReport() -> Data? {
+        performSync {
+            recordDiagnostics(force: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            return try? encoder.encode(PlaybackDiagnosticReport(
+                createdAt: Date(), reason: failureReason ?? "stopped normally", sampleRate: sampleRate, samples: diagnosticSamples
+            ))
+        }
+    }
+
+    private func recordDiagnostics(force: Bool = false) {
+        let now = DispatchTime.now().uptimeNanoseconds / 1_000_000
+        guard force || now >= lastDiagnosticTime + 250 else { return }
+        lastDiagnosticTime = now
+        let seconds = synchronizer.currentTime().seconds
+        diagnosticSamples.append(PlaybackDiagnosticSample(
+            uptimeMilliseconds: now, capturedFrames: capture.capturedFrameCount,
+            signalFrames: capture.signalFrameCount, capturedQueueFrames: capture.availableFrameCount,
+            rendererQueueFrames: queuedFrameCount(), playheadSeconds: seconds.isFinite ? seconds : nil,
+            requestedRate: synchronizer.rate, actualTimebaseRate: CMTimebaseGetRate(synchronizer.timebase),
+            sufficientData: renderer.hasSufficientMediaDataForReliablePlaybackStart,
+            resynchronizations: resynchronizationCount
+        ))
+        if diagnosticSamples.count > 80 { diagnosticSamples.removeFirst(diagnosticSamples.count - 80) }
+    }
+
     private func queuedFrameCount() -> Int64 {
         guard timelineIsRunning else { return enqueuedFrameCount }
         let playhead = CMTimeConvertScale(synchronizer.currentTime(), timescale: timeScale, method: .roundTowardNegativeInfinity)
@@ -272,7 +349,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
 
     private func pump() {
         guard isStarted && !failureWasDelivered else { return }
-        defer { updatePolling() }
+        defer { updatePolling(); recordDiagnostics() }
 
         if rendererRecoveryIsActive, !recoveryWindow.contains(DispatchTime.now().uptimeNanoseconds) {
             deliverFailure(RelayError.rendererFailed("the output did not recover within five seconds"))
@@ -316,7 +393,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         // until the synchronizer confirms it is paused, rather than relying on
         // a fixed delay under load.
         if let pauseTransitionStartTime {
-            if abs(synchronizer.rate) < 0.000_1 {
+            if abs(CMTimebaseGetRate(synchronizer.timebase)) < 0.000_1 {
                 self.pauseTransitionStartTime = nil
             } else if elapsedMilliseconds(since: pauseTransitionStartTime) > OutputReconfigurationGrace.durationMilliseconds {
                 deliverFailure(RelayError.rendererFailed("the render timeline did not pause"))
@@ -324,6 +401,17 @@ final class SampleBufferPlayer: @unchecked Sendable {
             } else {
                 return
             }
+        }
+
+        let currentPlayhead = synchronizer.currentTime()
+        let hasPlaybackProgress = timelineIsRunning && currentPlayhead.isNumeric &&
+            CMTimeCompare(currentPlayhead, mediaTime(forFrame: segmentStartFrame)) > 0
+        if hasPlaybackProgress {
+            timelineStartTime = nil
+        } else if let timelineStartTime,
+                  elapsedMilliseconds(since: timelineStartTime) > OutputReconfigurationGrace.durationMilliseconds {
+            deliverFailure(RelayError.rendererFailed("the playback clock did not start within five seconds"))
+            return
         }
 
         if rendererRecoveryIsActive,
@@ -334,23 +422,31 @@ final class SampleBufferPlayer: @unchecked Sendable {
             recoveryWindow.finish()
         }
 
-        if LivePlaybackPolicy.needsResynchronization(
+        let bufferAction = bufferMonitor.action(
             captured: capture.availableFrameCount,
             queued: queuedFrameCount(),
-            sampleRate: sampleRate
-        ) {
+            sampleRate: sampleRate,
+            playbackHasAdvanced: hasPlaybackProgress
+        )
+        if bufferAction == .stop {
+            deliverFailure(RelayError.rendererFailed("the renderer queued more than three seconds of audio"))
+            return
+        }
+        if bufferAction == .trimCapture || bufferAction == .resetRenderer {
             logger.notice("Buffer resync: capture=\(self.capture.availableFrameCount) queued=\(self.queuedFrameCount()) playhead=\(self.synchronizer.currentTime().seconds) rate=\(self.synchronizer.rate) sufficient=\(self.renderer.hasSufficientMediaDataForReliablePlaybackStart)")
             guard resynchronizationBudget.record(at: DispatchTime.now().uptimeNanoseconds) else {
-                deliverFailure(RelayError.rendererFailed("audio repeatedly exceeded the 350 ms live-buffer limit"))
+                deliverFailure(RelayError.rendererFailed("audio repeatedly accumulated excess buffering"))
                 return
             }
-            // Flush old queued audio and keep only a fresh startup buffer. Only
-            // this consumer moves the read cursor; the HAL producer stays live.
-            let playhead = synchronizer.currentTime()
-            resetTimeline(at: playhead.isNumeric ? playhead : mediaTime(forFrame: nextFrame))
+            // Trimming capture does not flush the native renderer's legitimate
+            // priming data. Reset that renderer only for excess post-start growth.
+            if bufferAction == .resetRenderer {
+                let playhead = synchronizer.currentTime()
+                resetTimeline(at: playhead.isNumeric ? playhead : mediaTime(forFrame: nextFrame))
+            }
             _ = capture.discardFramesKeepingLatest(UInt32(prebufferFrameCount))
             resynchronizationCount += 1
-            return
+            if bufferAction == .resetRenderer { return }
         }
 
         // If the control queue was delayed while Spotify was silent, the
@@ -408,6 +504,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
            enqueuedFrameCount >= prebufferFrameCount {
             synchronizer.setRate(1, time: mediaTime(forFrame: segmentStartFrame))
             timelineIsRunning = true
+            timelineStartTime = .now()
         }
 
         // The ring is normally empty while the renderer stays prebuffered. When
@@ -437,6 +534,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
         segmentStartFrame = restartFrame
         enqueuedFrameCount = 0
         timelineIsRunning = false
+        timelineStartTime = nil
+        bufferMonitor = LiveBufferMonitor()
         backpressureStartTime = nil
         pauseTransitionStartTime = .now()
     }
@@ -471,6 +570,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
         segmentStartFrame = restartFrame
         enqueuedFrameCount = 0
         timelineIsRunning = false
+        timelineStartTime = nil
+        bufferMonitor = LiveBufferMonitor()
         backpressureStartTime = nil
         pauseTransitionStartTime = .now()
     }
@@ -512,6 +613,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private func deliverFailure(_ error: Error) {
         guard !failureWasDelivered else { return }
         failureWasDelivered = true
+        failureReason = error.localizedDescription
+        recordDiagnostics(force: true)
         // The background coordinator owns HAL teardown. Never mutate capture
         // ownership on this queue while its health check may inspect the bridge.
         synchronizer.setRate(0, time: .invalid)

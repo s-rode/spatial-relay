@@ -23,10 +23,15 @@ final class CoreLogicTests: XCTestCase {
         XCTAssertTrue(window.contains(7_000_000_100))
     }
 
-    func testLatencyBudgetIncludesRendererQueue() {
-        XCTAssertFalse(LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 16_800, sampleRate: 48_000))
-        XCTAssertTrue(LivePlaybackPolicy.needsResynchronization(captured: 1, queued: 16_800, sampleRate: 48_000))
-        XCTAssertTrue(LivePlaybackPolicy.needsResynchronization(captured: 0, queued: 48_000, sampleRate: 48_000))
+    func testLatencyGuardAllowsNativePrimingAndBoundsGrowth() {
+        var monitor = LiveBufferMonitor()
+        for step in 1...100 {
+            XCTAssertEqual(monitor.action(captured: 0, queued: Int64(step * 480), sampleRate: 48_000, playbackHasAdvanced: false), .none)
+        }
+        XCTAssertEqual(monitor.action(captured: 0, queued: 48_000, sampleRate: 48_000, playbackHasAdvanced: true), .none)
+        XCTAssertEqual(monitor.action(captured: 0, queued: 64_801, sampleRate: 48_000, playbackHasAdvanced: true), .resetRenderer)
+        XCTAssertEqual(monitor.action(captured: 20_000, queued: 0, sampleRate: 48_000, playbackHasAdvanced: false), .trimCapture)
+        XCTAssertEqual(monitor.action(captured: 0, queued: 144_001, sampleRate: 48_000, playbackHasAdvanced: false), .stop)
     }
 
     func testDiscardKeepsNewestFramesWithoutResettingCapture() throws {
