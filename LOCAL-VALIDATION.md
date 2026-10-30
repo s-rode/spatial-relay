@@ -38,5 +38,7 @@ Observed on 30 October 2026
 ---------------------------
 
 - The generated nonzero-signal test passed on built-in speakers and on connected AirPods Pro. The revised AirPods Pro run used a hard -100 dBFS amplitude limit and no system-volume changes; it transferred 291,840 signal frames, advanced the native playback clock, and had zero resyncs over six seconds. Recent relay queue estimates were 301–315 ms. This did not tap Spotify.
-- The user confirmed that version 0.3.1 continues Spotify playback with a moving green input meter. This establishes an actual nonzero Spotify relay path, beyond the earlier silent probe. Fixed/Head Tracked and route-transition checks remain separate.
+- The user confirmed that version 0.3.1 continues Spotify playback with a moving green input meter. This establishes an actual nonzero Spotify relay path, beyond the earlier silent probe. The user subsequently confirmed that Fixed spatialization works, followed by successful 10-second pause/resume and Stop relay → Start relay checks. Head tracking is outside the user's requested validation; automatic device switching has not been physically validated.
 - Native UI automation timed out, so the physical listening checks require the user. No success is inferred from a selectable menu option alone.
+
+The saved timing-only report from the user’s normal stop records nonzero Spotify signal frames, zero resyncs, and approximately 524–535 ms queued internally. That native Fixed-mode queue is legitimate playback latency, not excess growth. It is higher than the synthetic-signal run, which demonstrates why a fixed 350 ms combined limit was unsuitable. This estimate excludes Bluetooth, device, and other system latency.
